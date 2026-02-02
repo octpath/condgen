@@ -1,25 +1,14 @@
-"""統合学習スクリプト: U-Net (cond_method) または DiT (--model dit)。
+"""実験 B: U-Net with AdaLN（AdaGroupNorm）複合条件（年齢 + 性別）の学習。
 
-scale_model_input と CFG を正しく適用し、CFG なしと scale=1.0 で一致する。
-- 出力先: --output_dir が既に存在する場合は連番 suffix（_1, _2, ...）を付与。
-- ログ: output_dir/run.log に loguru の出力を追加。
-- Resume: --resume で output_dir の最新チェックポイント（resume_state.pt または model_epoch_*.pt）から再開。
-
-実行例:
-  python src/training/train_flexible.py --cond_method adaln --fourier_scale 5.0
-  python src/training/train_flexible.py --model dit --patch_size 2 --hidden_size 384 --lr 1e-4
-  python src/training/train_flexible.py --output_dir outputs/dit_pixel --resume
-
-  # U-Net CrossAttn Ablation（Fourier あり/なし）
-  python src/training/train_flexible.py --model unet --cond_method cross_attn  # Baseline: Fourier あり
-  python src/training/train_flexible.py --model unet --cond_method cross_attn --no_fourier  # Ablation: Fourier なし
+条件は AdaGroupNorm（Zero-Init）で注入。Time は scale_shift のみ。
+以前の FiLM 版の重みは互換性がないため、必ずスクラッチから学習すること。
+検証時は「男性/女性 × 年齢変化」のグリッド・モーフィング動画を生成。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from pathlib import Path
 from typing import Optional
@@ -29,40 +18,20 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from diffusers import DDIMScheduler, DDPMScheduler
 from diffusers.training_utils import EMAModel
 from loguru import logger
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from src.dataset.loader import AGE_MAX, UTKFaceDataset
-from src.models.dit_flexible import DiT_Pixel
-from src.models.unet_flexible import COND_METHODS, FlexibleConditionalUNet, GENDER_NULL_INDEX
+from src.models.unet_adaln_complex import GENDER_NULL_INDEX, UNetAdaLNComplex
 from src.utils.common import seed_everything
 from src.utils.visualize import create_morphing_gif, ddim_step_with_scale_and_cfg, save_image_grid
-
-
-def get_cosine_schedule_with_warmup(
-    optimizer: torch.optim.Optimizer,
-    num_warmup_steps: int,
-    num_training_steps: int,
-) -> LambdaLR:
-    """Linear warmup のあと cosine decay。DiT の安定学習用。"""
-
-    def lr_lambda(current_step: int) -> float:
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(
-            max(1, num_training_steps - num_warmup_steps)
-        )
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-    return LambdaLR(optimizer, lr_lambda)
 
 try:
     import wandb
@@ -73,13 +42,36 @@ except ImportError:
 
 
 # -----------------------------------------------------------------------------
-# Sampling（scale_model_input + CFG 対応）
+# Sampling（年齢 + 性別、DDIM）
 # -----------------------------------------------------------------------------
 
 
 @torch.no_grad()
-def sample_flexible_from_noise(
-    model: nn.Module,
+def sample_with_age_gender(
+    model: UNetAdaLNComplex,
+    scheduler,
+    age: float,
+    gender: int,
+    batch_size: int = 1,
+    num_inference_steps: int = 50,
+    device: torch.device = torch.device("cpu"),
+    sample_size: int = 64,
+) -> torch.Tensor:
+    model.eval()
+    scheduler.set_timesteps(num_inference_steps, device=device)
+    x_t = torch.randn(batch_size, 3, sample_size, sample_size, device=device, dtype=next(model.parameters()).dtype)
+    age_t = torch.full((batch_size,), age, device=device, dtype=x_t.dtype)
+    gender_t = torch.full((batch_size,), gender, dtype=torch.long, device=device)
+    for t in tqdm(scheduler.timesteps, desc=f"Sampling (age={age:.2f}, gender={gender})", leave=False):
+        t_batch = torch.full((batch_size,), t, dtype=torch.long, device=device)
+        noise_pred = model(x_t, t_batch, age_t, gender_t)
+        x_t = scheduler.step(noise_pred, t, x_t).prev_sample
+    return x_t
+
+
+@torch.no_grad()
+def sample_with_age_gender_from_noise(
+    model: UNetAdaLNComplex,
     scheduler,
     x_t_initial: torch.Tensor,
     age: float,
@@ -87,13 +79,12 @@ def sample_flexible_from_noise(
     num_inference_steps: int = 50,
     device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
-    """DDIM サンプリング。scale_model_input を適用。forward(sample, timestep, age, gender)。"""
+    """DDIM サンプリング。scale_model_input を適用し、CFG なしと scale=1.0 で一致する。"""
     model.eval()
     scheduler.set_timesteps(num_inference_steps, device=device)
     x_t = x_t_initial.clone()
     B = x_t.shape[0]
-    dtype = next(model.parameters()).dtype
-    age_t = torch.full((B,), age, device=device, dtype=dtype)
+    age_t = torch.full((B,), age, device=device, dtype=x_t.dtype)
     gender_t = torch.full((B,), gender, dtype=torch.long, device=device)
 
     def model_forward_fn(latent_model_input: torch.Tensor, t_batch: torch.Tensor) -> torch.Tensor:
@@ -110,8 +101,8 @@ def sample_flexible_from_noise(
 
 
 @torch.no_grad()
-def sample_flexible_from_noise_cfg(
-    model: nn.Module,
+def sample_with_age_gender_from_noise_cfg(
+    model: UNetAdaLNComplex,
     scheduler,
     x_t_initial: torch.Tensor,
     age: float,
@@ -155,7 +146,7 @@ def sample_flexible_from_noise_cfg(
 
 
 def train(
-    model: nn.Module,
+    model: UNetAdaLNComplex,
     ema_model: Optional[EMAModel],
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
@@ -164,9 +155,7 @@ def train(
     epoch: int = 0,
     label_jitter_std: float = 0.05,
     cfg_drop_rate: float = 0.1,
-    step_lr_scheduler: Optional[LambdaLR] = None,
 ) -> float:
-    """step_lr_scheduler: DiT 用。渡すとバッチごとに step() する。"""
     model.train()
     total_loss = 0.0
     progress = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not accelerator.is_local_main_process)
@@ -192,8 +181,6 @@ def train(
         accelerator.backward(loss)
         optimizer.step()
         optimizer.zero_grad()
-        if step_lr_scheduler is not None:
-            step_lr_scheduler.step()
         if ema_model is not None:
             ema_model.step(model.parameters())
         total_loss += loss.item()
@@ -207,7 +194,7 @@ def train(
 
 
 def create_gender_age_grid(
-    model: nn.Module,
+    model: UNetAdaLNComplex,
     ema_model: Optional[EMAModel],
     ddpm_scheduler: DDPMScheduler,
     accelerator: Accelerator,
@@ -217,7 +204,7 @@ def create_gender_age_grid(
     num_inference_steps: int = 50,
     morphing_seed: int = 42,
     ages_for_grid: list[float] = [20, 40, 60, 80],
-    seeds_for_grid: list[int] = (42, 200, 8931, 12345),
+    seeds_for_grid: list[int] = (42, 43, 44, 45),
     age_min: int = 0,
     age_max: int = 100,
     age_step: int = 5,
@@ -241,7 +228,7 @@ def create_gender_age_grid(
             fixed_noise = torch.randn(1, 3, sample_size, sample_size, device=device, dtype=dtype)
             row_samples = []
             for age_norm in ages_norm:
-                s = sample_flexible_from_noise(
+                s = sample_with_age_gender_from_noise(
                     model, ddim, fixed_noise, age_norm, gender_int,
                     num_inference_steps=num_inference_steps, device=device,
                 )
@@ -260,7 +247,7 @@ def create_gender_age_grid(
 
     for gender_int, name in [(0, "male"), (1, "female")]:
         def sample_fn(age_norm: float, noise: torch.Tensor) -> torch.Tensor:
-            return sample_flexible_from_noise(
+            return sample_with_age_gender_from_noise(
                 model, ddim, noise, age_norm, gender_int,
                 num_inference_steps=num_inference_steps, device=device,
             )
@@ -280,124 +267,47 @@ def create_gender_age_grid(
 
 
 # -----------------------------------------------------------------------------
-# 出力先・Resume・ログ
+# Main
 # -----------------------------------------------------------------------------
 
 
-def resolve_output_dir(base: str | Path, resume: bool) -> Path:
-    """出力先を解決する。resume でないとき既存ディレクトリなら連番 suffix を付与。"""
-    base = Path(base)
-    if resume:
-        if not base.is_dir():
-            raise FileNotFoundError(f"Resume 先のディレクトリが存在しません: {base}")
-        return base
-    # 重複時は base_1, base_2, ... のうち存在しない最初のものを返す
-    cand = base
-    n = 0
-    while cand.exists():
-        n += 1
-        cand = base.parent / f"{base.name}_{n}"
-    return cand
-
-
-def setup_file_logging(log_path: Path) -> None:
-    """loguru の出力を output_dir/run.log にも追加する。"""
-    logger.add(
-        str(log_path),
-        level="INFO",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
-        rotation=None,
-        enqueue=True,
-    )
-
-
-def find_latest_checkpoint_epoch(checkpoints_dir: Path) -> int:
-    """checkpoints_dir 内の model_epoch_*.pt / *_ema.pt の最大エポック番号を返す。なければ 0。"""
-    if not checkpoints_dir.is_dir():
-        return 0
-    max_epoch = 0
-    for p in checkpoints_dir.glob("model_epoch_*.pt"):
-        stem = p.stem.replace("_ema", "")
-        try:
-            epoch = int(stem.split("epoch_")[1].split(".")[0])
-            max_epoch = max(max_epoch, epoch)
-        except (IndexError, ValueError):
-            continue
-    return max_epoch
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Flexible: U-Net (cond_method) or DiT (--model dit)."
-    )
-    parser.add_argument("--model", type=str, default="unet", choices=["unet", "dit"],
-                        help="unet: FlexibleConditionalUNet, dit: DiT_Pixel (pixel-space)")
-    parser.add_argument("--cond_method", type=str, default="adaln", choices=list(COND_METHODS),
-                        help="U-Net only: concat, cross_attn, adaln")
-    parser.add_argument("--fourier_scale", type=float, default=5.0,
-                        help="GaussianFourierProjection scale (U-Net/DiT)")
-    parser.add_argument("--no_fourier", action="store_true",
-                        help="U-Net CrossAttn のみ: 年齢を Fourier 特徴量ではなく生スカラー MLP で埋め込む（Ablation）")
-    parser.add_argument("--learning_rate", "--lr", type=float, default=1e-4, dest="lr",
-                        help="Learning rate")
+    parser = argparse.ArgumentParser(description="Experiment B: U-Net with AdaLN/FiLM (age + gender)")
     parser.add_argument("--data_root", type=str, default="data/raw/UTKFace")
-    parser.add_argument("--output_dir", type=str, default="outputs/flexible",
-                        help="出力先。既存なら連番 suffix 付与（--resume 時はそのまま使用）")
-    parser.add_argument("--resume", action="store_true",
-                        help="output_dir の最新チェックポイントから再開する")
+    parser.add_argument("--output_dir", type=str, default="outputs/unet_adaln")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--label_jitter_std", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--wandb_project", type=str, default="flexible-unet")
+    parser.add_argument("--wandb_project", type=str, default="unet-adaln")
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--no_ema", action="store_true")
     parser.add_argument("--cfg_drop_rate", type=float, default=0.1,
                         help="CFG: 条件を Null にドロップする確率 (gender=2, use_null_age=True)")
-    # DiT (--model dit) 用
-    parser.add_argument("--patch_size", type=int, default=2,
-                        help="DiT only: patch size (2 推奨で細部を捉える)")
-    parser.add_argument("--hidden_size", type=int, default=384,
-                        help="DiT only: hidden dim")
-    parser.add_argument("--depth", type=int, default=12,
-                        help="DiT only: number of transformer layers")
-    parser.add_argument("--num_heads", type=int, default=6,
-                        help="DiT only: attention heads")
-    parser.add_argument("--warmup_steps", type=int, default=1000,
-                        help="DiT only: linear warmup ステップ数 (初期勾配爆発防止)")
     args = parser.parse_args()
 
     seed_everything(args.seed)
-    output_dir = resolve_output_dir(args.output_dir, resume=args.resume)
+    output_dir = Path(args.output_dir)
     samples_dir = output_dir / "samples"
     checkpoints_dir = output_dir / "checkpoints"
     samples_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-    # 出力先直下に run.log を追加（コンソールに加えてファイルにも出力）
-    log_path = output_dir / "run.log"
-    setup_file_logging(log_path)
-    logger.info(f"Output dir: {output_dir} (log: {log_path})")
-
-    # 実験条件を config.json に保存（resume でないときのみ上書き；resume 時は既存を利用）
+    # 実験条件を config.json に保存（どの条件で学習したかチェックポイントと一緒に残す）
     config_path = output_dir / "config.json"
-    if not args.resume:
-        try:
-            config_dict = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config_dict, f, indent=2, ensure_ascii=False)
-            logger.info(f"Saved config: {config_path}")
-        except Exception as e:
-            logger.warning(f"Could not save config.json: {e}")
+    try:
+        config_dict = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config_dict, f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved config: {config_path}")
+    except Exception as e:
+        logger.warning(f"Could not save config.json: {e}")
 
     accelerator = Accelerator(mixed_precision="fp16")
-    use_dit = args.model == "dit"
-    logger.info(
-        f"Device: {accelerator.device}, model={args.model}"
-        + (f", cond_method={args.cond_method}" if not use_dit else f", patch_size={args.patch_size}, hidden_size={args.hidden_size}, depth={args.depth}")
-    )
+    logger.info(f"Device: {accelerator.device}, Mixed Precision: fp16")
     if accelerator.is_main_process and not args.no_wandb and WANDB_AVAILABLE:
         wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
 
@@ -405,113 +315,36 @@ def main() -> None:
     logger.info(f"Dataset size: {len(dataset)}")
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
-    if use_dit:
-        model = DiT_Pixel(
-            img_size=64,
-            patch_size=args.patch_size,
-            in_channels=3,
-            hidden_dim=args.hidden_size,
-            depth=args.depth,
-            num_heads=args.num_heads,
-            mlp_ratio=4.0,
-            time_embed_dim=256,
-            age_embed_dim=64,
-            gender_embed_dim=64,
-            fourier_scale=args.fourier_scale,
-        )
-        weight_decay = 0.01
-    else:
-        model = FlexibleConditionalUNet(
-            cond_method=args.cond_method,
-            fourier_scale=args.fourier_scale,
-            sample_size=64,
-            block_out_channels=(64, 128, 256),
-            cross_attention_dim=128,
-            norm_num_groups=8,
-            layers_per_block=2,
-            transformer_layers_per_block=1,
-            use_fourier_features=not args.no_fourier,
-        )
-        weight_decay = 1e-2
-
+    model = UNetAdaLNComplex(
+        in_channels=3,
+        out_channels=3,
+        block_out_channels=(64, 128, 256),
+        time_embed_dim=256,
+        age_embed_dim=64,
+        gender_embed_dim=64,
+    )
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     ddpm_scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule="squaredcos_cap_v2")
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
-
-    if use_dit:
-        step_lr_scheduler = None
-        lr_scheduler = None
-    else:
-        step_lr_scheduler = None
-        lr_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+    lr_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     ema_model = None
     if not args.no_ema:
         ema_model = EMAModel(model.parameters(), decay=args.ema_decay, use_ema_warmup=True, inv_gamma=1.0, power=0.75)
         logger.info(f"EMA enabled decay={args.ema_decay}")
 
-    to_prepare: list = [model, optimizer, dataloader]
-    if lr_scheduler is not None:
-        to_prepare.append(lr_scheduler)
-    prepared = accelerator.prepare(*to_prepare)
-    model = prepared[0]
-    optimizer = prepared[1]
-    dataloader = prepared[2]
-    if lr_scheduler is not None:
-        lr_scheduler = prepared[3]
-
-    if use_dit:
-        num_training_steps = args.epochs * len(dataloader)
-        warmup_steps = min(args.warmup_steps, max(1, num_training_steps // 10))
-        step_lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=warmup_steps, num_training_steps=num_training_steps
-        )
-        logger.info(f"DiT: cosine with warmup (warmup={warmup_steps}, total={num_training_steps})")
-
+    model, optimizer, dataloader, lr_scheduler = accelerator.prepare(model, optimizer, dataloader, lr_scheduler)
     if ema_model is not None:
         ema_model.to(accelerator.device)
 
-    start_epoch = 1
-    if args.resume:
-        resume_pt = checkpoints_dir / "resume_state.pt"
-        latest_epoch = find_latest_checkpoint_epoch(checkpoints_dir)
-        if latest_epoch <= 0 and not resume_pt.exists():
-            logger.warning("--resume を指定しましたがチェックポイントが見つかりません。先頭から開始します。")
-        else:
-            unwrapped = accelerator.unwrap_model(model)
-            if resume_pt.exists():
-                state = torch.load(resume_pt, map_location=accelerator.device, weights_only=False)
-                unwrapped.load_state_dict(state["model"], strict=True)
-                optimizer.load_state_dict(state["optimizer"])
-                if lr_scheduler is not None and state.get("lr_scheduler") is not None:
-                    lr_scheduler.load_state_dict(state["lr_scheduler"])
-                if step_lr_scheduler is not None and state.get("step_lr_scheduler") is not None:
-                    step_lr_scheduler.load_state_dict(state["step_lr_scheduler"])
-                start_epoch = state.get("epoch", latest_epoch) + 1
-                logger.info(f"Resumed from {resume_pt} (epoch {start_epoch - 1} -> start at {start_epoch})")
-            else:
-                ckpt_path = checkpoints_dir / f"model_epoch_{latest_epoch:04d}.pt"
-                if ckpt_path.exists():
-                    unwrapped.load_state_dict(
-                        torch.load(ckpt_path, map_location=accelerator.device, weights_only=True),
-                        strict=True,
-                    )
-                start_epoch = latest_epoch + 1
-                logger.info(f"Resumed model from {ckpt_path} (epoch {start_epoch - 1} -> start at {start_epoch}, optimizer/scheduler は初期状態)")
+    logger.info(f"Training UNetAdaLNComplex for {args.epochs} epochs, batch_size={args.batch_size}, lr={args.lr}, weight_decay=1e-2, CosineAnnealingLR")
 
-    logger.info(
-        f"Training {'DiT_Pixel' if use_dit else 'FlexibleConditionalUNet'}"
-        f" for {args.epochs} epochs (from epoch {start_epoch}), lr={args.lr}, weight_decay={weight_decay}"
-    )
-
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(1, args.epochs + 1):
         avg_loss = train(
             model, ema_model, dataloader, optimizer, ddpm_scheduler, accelerator,
             epoch=epoch, label_jitter_std=args.label_jitter_std, cfg_drop_rate=args.cfg_drop_rate,
-            step_lr_scheduler=step_lr_scheduler,
         )
-        if lr_scheduler is not None:
-            lr_scheduler.step()
+        lr_scheduler.step()
         logger.info(f"Epoch {epoch}/{args.epochs} - Loss: {avg_loss:.4f}")
         if accelerator.is_main_process:
             if not args.no_wandb and WANDB_AVAILABLE and wandb.run is not None:
@@ -532,15 +365,6 @@ def main() -> None:
                     torch.save(accelerator.unwrap_model(model).state_dict(), ema_ckpt_path)
                     ema_model.restore(model.parameters())
                     logger.info(f"Saved EMA checkpoint: {ema_ckpt_path}")
-                # Resume 用: エポック・optimizer・scheduler をまとめて保存
-                resume_state = {
-                    "epoch": epoch,
-                    "model": accelerator.unwrap_model(model).state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
-                    "step_lr_scheduler": step_lr_scheduler.state_dict() if step_lr_scheduler is not None else None,
-                }
-                torch.save(resume_state, checkpoints_dir / "resume_state.pt")
 
     if accelerator.is_main_process and not args.no_wandb and WANDB_AVAILABLE and wandb.run is not None:
         wandb.finish()

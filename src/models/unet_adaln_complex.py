@@ -13,11 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.dit import GaussianFourierProjection
+from src.models.embeddings import GENDER_NULL_INDEX, GaussianFourierProjection
 
-
-# CFG 用: 性別の Null Token は Embedding の index 2
-GENDER_NULL_INDEX = 2
 
 __all__ = ["AdaGroupNorm", "UNetAdaLNComplex", "GENDER_NULL_INDEX"]
 

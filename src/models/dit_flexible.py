@@ -14,30 +14,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.models.embeddings import GENDER_NULL_INDEX, GaussianFourierProjection
 
-# CFG 用: 性別の Null Token は Embedding の index 2
-GENDER_NULL_INDEX = 2
 
 __all__ = ["modulate", "DiTBlock", "DiT_Flexible", "DiT_Pixel", "GENDER_NULL_INDEX"]
 
 
 # -----------------------------------------------------------------------------
-# Embeddings（Fourier Scale 5.0 をデフォルトに）
+# Time Embedding（正弦波）
 # -----------------------------------------------------------------------------
-
-
-class GaussianFourierProjection(nn.Module):
-    """Gaussian Fourier Projection for continuous scalar (e.g. age)."""
-
-    def __init__(self, embed_dim: int, scale: float = 5.0) -> None:
-        super().__init__()
-        half_dim = embed_dim // 2
-        self.register_buffer("W", torch.randn(half_dim) * scale)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B,) -> (B, embed_dim)"""
-        x_proj = x[:, None].float() * self.W[None, :] * 2 * math.pi
-        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 
 def sinusoidal_timestep_embedding(

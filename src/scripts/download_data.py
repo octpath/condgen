@@ -2,6 +2,8 @@
 
 nu-delta/utkface は Parquet 形式のため、snapshot_download で Parquet のみ取得し、
 datasets で読み込んでから画像を data/raw/UTKFace に展開する。
+
+単独実行: uv run python src/scripts/download_data.py [--save-dir PATH] [--repo-id ID]
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ import argparse
 from pathlib import Path
 from typing import Union
 
-# プロジェクトルートを基準に data/raw を決定
+# プロジェクトルートを基準に data/raw を決定（src/scripts/download_data.py -> parents[2]=workspace）
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_RAW = REPO_ROOT / "data" / "raw"
 UTKFACE_SAVE_DIR = DATA_RAW / "UTKFace"

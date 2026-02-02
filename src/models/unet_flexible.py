@@ -13,12 +13,13 @@ import torch
 import torch.nn as nn
 from diffusers import UNet2DModel, UNet2DConditionModel
 
-from src.models.dit import GaussianFourierProjection
-from src.models.unet_adaln_complex import GENDER_NULL_INDEX, UNetAdaLNComplex
+from src.models.embeddings import GENDER_NULL_INDEX, GaussianFourierProjection
+from src.models.unet_adaln_complex import UNetAdaLNComplex
 
 
 __all__ = ["FlexibleConditionalUNet", "COND_METHODS", "GENDER_NULL_INDEX"]
 
+# U-Net 条件付け手法（train_flexible の --cond_method と一致）
 COND_METHODS = ("concat", "cross_attn", "adaln")
 
 
@@ -55,7 +56,11 @@ def _create_concat_backbone(
 
 
 class AgeGenderEncoder(nn.Module):
-    """Age (Fourier or null_age_embed) + Gender (Embedding, index 2=Null) -> (B, 1, cross_attention_dim)."""
+    """Age (Fourier or Raw MLP / null_age_embed) + Gender (Embedding, index 2=Null) -> (B, 1, cross_attention_dim).
+
+    use_fourier_features=True: GaussianFourierProjection -> 既存 MLP（Ablation の Baseline）。
+    use_fourier_features=False: 生スカラー (B,1) -> Linear(1, hidden_dim) -> SiLU -> Linear(hidden_dim, embed_dim)（Ablation: Fourier なし）。
+    """
 
     def __init__(
         self,
@@ -63,10 +68,26 @@ class AgeGenderEncoder(nn.Module):
         fourier_embed_dim: int = 64,
         fourier_scale: float = 10.0,
         gender_embed_dim: int = 64,
+        use_fourier_features: bool = True,
+        raw_mlp_hidden_dim: int = 64,
     ) -> None:
         super().__init__()
         self.cross_attention_dim = cross_attention_dim
-        self.fourier = GaussianFourierProjection(fourier_embed_dim, scale=fourier_scale)
+        self.fourier_embed_dim = fourier_embed_dim
+        self.use_fourier_features = use_fourier_features
+
+        if use_fourier_features:
+            self.fourier = GaussianFourierProjection(fourier_embed_dim, scale=fourier_scale)
+            self.age_mlp_raw = None
+        else:
+            self.fourier = None
+            # 生スカラー (B, 1) -> hidden -> fourier_embed_dim（下流 MLP の入力次元を揃える）
+            self.age_mlp_raw = nn.Sequential(
+                nn.Linear(1, raw_mlp_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(raw_mlp_hidden_dim, fourier_embed_dim),
+            )
+
         self.null_age_embed = nn.Parameter(torch.randn(1, fourier_embed_dim))
         self.gender_embed = nn.Embedding(3, gender_embed_dim)
         self.mlp = nn.Sequential(
@@ -92,9 +113,14 @@ class AgeGenderEncoder(nn.Module):
             use_null_age = torch.zeros(B, dtype=torch.bool, device=device)
         elif isinstance(use_null_age, bool):
             use_null_age = torch.full((B,), use_null_age, dtype=torch.bool, device=device)
-        a_fourier = self.fourier(age)
+
+        if self.use_fourier_features:
+            a_feat = self.fourier(age)
+        else:
+            a_feat = self.age_mlp_raw(age.unsqueeze(1).float())
+
         a_null = self.null_age_embed.expand(B, -1)
-        a_emb = torch.where(use_null_age.unsqueeze(1), a_null, a_fourier)
+        a_emb = torch.where(use_null_age.unsqueeze(1), a_null, a_feat)
         g_emb = self.gender_embed(gender.long().clamp(0, GENDER_NULL_INDEX))
         x = torch.cat([a_emb, g_emb], dim=-1)
         x = self.mlp(x)
@@ -147,6 +173,7 @@ class FlexibleConditionalUNet(nn.Module):
         norm_num_groups: int = 8,
         layers_per_block: int = 2,
         transformer_layers_per_block: int = 1,
+        use_fourier_features: bool = True,
     ) -> None:
         super().__init__()
         self.cond_method = cond_method
@@ -175,6 +202,7 @@ class FlexibleConditionalUNet(nn.Module):
                 fourier_embed_dim=64,
                 fourier_scale=fourier_scale,
                 gender_embed_dim=64,
+                use_fourier_features=use_fourier_features,
             )
         elif cond_method == "adaln":
             self.backbone = UNetAdaLNComplex(
