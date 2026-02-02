@@ -267,6 +267,47 @@ def create_gender_age_grid_from_fn(
     save_image_grid(grid_tensor, path, nrow=nrow, input_range=(-1.0, 1.0))
 
 
+def create_multi_noise_gender_age_grid_from_fn(
+    sample_fn: Callable[[float, int, torch.Tensor], torch.Tensor],
+    path: Union[str, Path],
+    ages_norm: List[float],
+    num_noise: int = 1,
+    seed: int = 42,
+    sample_size: int = 64,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    nrow: Optional[int] = None,
+) -> None:
+    """複数ノイズ × 性別 × 年齢のグリッドを生成・保存する。
+
+    レイアウト: (2 * num_noise) 行 × len(ages_norm) 列。
+    上半分 num_noise 行: Male (gender=0)、各行で異なるノイズ（seed, seed+1, ...）。
+    下半分 num_noise 行: Female (gender=1)、同様に各行で異なるノイズ。
+    sample_fn(age_norm, gender_int, noise) -> (1, C, H, W)。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    device = device or torch.device("cpu")
+    dtype = dtype or torch.float32
+    nrow = nrow or len(ages_norm)
+    rows = []
+    for gender_int in (0, 1):
+        for i in range(num_noise):
+            torch.manual_seed(seed + i)
+            noise = torch.randn(1, 3, sample_size, sample_size, device=device, dtype=dtype)
+            row_samples = []
+            for age_norm in ages_norm:
+                out = sample_fn(age_norm, gender_int, noise)
+                if out.dim() == 4 and out.shape[0] == 1:
+                    out = out
+                elif out.dim() == 3:
+                    out = out.unsqueeze(0)
+                row_samples.append(out)
+            rows.append(torch.cat(row_samples, dim=0))
+    grid_tensor = torch.cat(rows, dim=0)
+    save_image_grid(grid_tensor, path, nrow=nrow, input_range=(-1.0, 1.0))
+
+
 def save_multi_scale_grids(
     sample_fn_factory: Callable[[float], Callable[[float, int, torch.Tensor], torch.Tensor]],
     output_dir: Union[str, Path],
@@ -276,34 +317,48 @@ def save_multi_scale_grids(
     seed: int = 42,
     sample_size: int = 64,
     num_inference_steps: int = 50,
+    num_noise: int = 1,
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
 ) -> None:
-    """Guidance Scale ごとの「性別×年齢」グリッドを生成・保存する（スケール比較用）。
+    """Guidance Scale ごとのグリッドを生成・保存する（スケール比較用）。
 
     sample_fn_factory(guidance_scale) が sample_fn(age_norm, gender_int, noise) を返す。
-    全スケールで同一の固定ノイズを使い、DDIM で決定論的に生成する。
+    num_noise=1 のときは 2 行(Male/Female)×Age 列。num_noise>1 のときは (2*num_noise) 行×Age 列（上半分=Male、下半分=Female、各行で異なるノイズ）。
     保存先: output_dir/grid_scale_1.5.png ... grid_scale_12.0.png
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = device or torch.device("cpu")
     dtype = dtype or torch.float32
-    torch.manual_seed(seed)
-    fixed_noise = torch.randn(1, 3, sample_size, sample_size, device=device, dtype=dtype)
     ages_norm = [a / age_scale for a in ages]
     for gs in scales:
         sample_fn = sample_fn_factory(gs)
         path = output_dir / f"grid_scale_{gs}.png"
-        create_gender_age_grid_from_fn(
-            sample_fn,
-            path,
-            ages_norm=ages_norm,
-            genders=[0, 1],
-            fixed_noise=fixed_noise,
-            seed=seed,
-            sample_size=sample_size,
-            device=device,
-            dtype=dtype,
-            nrow=len(ages),
-        )
+        if num_noise <= 1:
+            torch.manual_seed(seed)
+            fixed_noise = torch.randn(1, 3, sample_size, sample_size, device=device, dtype=dtype)
+            create_gender_age_grid_from_fn(
+                sample_fn,
+                path,
+                ages_norm=ages_norm,
+                genders=[0, 1],
+                fixed_noise=fixed_noise,
+                seed=seed,
+                sample_size=sample_size,
+                device=device,
+                dtype=dtype,
+                nrow=len(ages),
+            )
+        else:
+            create_multi_noise_gender_age_grid_from_fn(
+                sample_fn,
+                path,
+                ages_norm=ages_norm,
+                num_noise=num_noise,
+                seed=seed,
+                sample_size=sample_size,
+                device=device,
+                dtype=dtype,
+                nrow=len(ages),
+            )
