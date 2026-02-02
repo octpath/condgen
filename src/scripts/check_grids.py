@@ -3,12 +3,13 @@
 
 train_flexible.py で学習したモデル（FlexibleConditionalUNet / DiT_Pixel）または
 train_unet_adaln で学習した UNetAdaLNComplex をロードし、save_multi_scale_grids で
-スケールごとの「性別×年齢」グリッドを DDIM + CFG で決定論的に生成・保存する。
+スケールごとのグリッドを DDIM + CFG で決定論的に生成・保存する。
+グリッド: (2*num_noise) 行 × Age 列。上半分=Male、下半分=Female。--num_noise でノイズ種類数、--ages で年齢列を指定可能。
 
 実行例（プロジェクトルートから）:
   uv run python src/scripts/check_grids.py
-  uv run python src/scripts/check_grids.py --checkpoint_dir outputs/dit_pixel/checkpoints --output_dir outputs/dit_pixel/samples
-  uv run python src/scripts/check_grids.py --checkpoint_dir outputs/unet_adaln/checkpoints --no_ema
+  uv run python src/scripts/check_grids.py --ages 20 40 60 80 --num_noise 3
+  uv run python src/scripts/check_grids.py --checkpoint_dir outputs/dit_pixel/checkpoints --no_ema
 """
 
 from __future__ import annotations
@@ -55,10 +56,23 @@ def main() -> None:
         help="Guidance scales to compare",
     )
     parser.add_argument(
+        "--ages",
+        type=float,
+        nargs="+",
+        default=[20.0, 40.0, 60.0, 80.0, 100.0],
+        help="Age 列（生値）。例: --ages 20 40 60 80 100",
+    )
+    parser.add_argument(
+        "--num_noise",
+        type=int,
+        default=1,
+        help="使用するノイズ画像の種類数。2 以上で (2*num_noise) 行×Age 列（上半分=Male、下半分=Female）",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed for fixed noise",
+        help="Random seed for fixed noise (num_noise>1 のとき seed, seed+1, ... を使用)",
     )
     parser.add_argument(
         "--num_inference_steps",
@@ -120,16 +134,20 @@ def main() -> None:
 
         return sample_fn
 
-    logger.info(f"Saving multi-scale grids to {output_dir} (scales={args.scales})")
+    ages_list = [float(a) for a in args.ages]
+    logger.info(
+        f"Saving multi-scale grids to {output_dir} (scales={args.scales}, ages={ages_list}, num_noise={args.num_noise})"
+    )
     save_multi_scale_grids(
         sample_fn_factory,
         output_dir,
         scales=args.scales,
-        ages=[20, 40, 60, 80, 100],
+        ages=ages_list,
         age_scale=116.0,
         seed=args.seed,
         sample_size=64,
         num_inference_steps=args.num_inference_steps,
+        num_noise=args.num_noise,
         device=device,
         dtype=dtype,
     )
